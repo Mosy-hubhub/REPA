@@ -21,8 +21,39 @@ from PIL import Image
 import numpy as np
 import math
 import argparse
+try:
+    BooleanOptionalAction = argparse.BooleanOptionalAction
+except AttributeError:
+    class BooleanOptionalAction(argparse.Action):
+        def __init__(self, option_strings, dest, default=None, **kwargs):
+            option_strings_with_no = []
+            for option_string in option_strings:
+                option_strings_with_no.append(option_string)
+                if option_string.startswith("--"):
+                    option_strings_with_no.append("--no-" + option_string[2:])
+            super().__init__(option_strings=option_strings_with_no, dest=dest, nargs=0, default=default, **kwargs)
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            setattr(namespace, self.dest, not option_string.startswith("--no-"))
+
+from datetime import timedelta
 from samplers import euler_sampler, euler_maruyama_sampler
 from utils import load_legacy_checkpoints, download_model
+
+
+def infer_run_name_from_ckpt(ckpt_path):
+    """
+    Infer the training run / experiment directory name from a checkpoint path.
+    """
+    if ckpt_path is None:
+        return "pretrained"
+
+    normalized_path = os.path.normpath(ckpt_path)
+    checkpoint_dir = os.path.dirname(normalized_path)
+    run_dir = os.path.dirname(checkpoint_dir)
+    run_name = os.path.basename(run_dir)
+    return run_name if run_name else "unknown-run"
+
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
     """
@@ -50,7 +81,10 @@ def main(args):
     torch.set_grad_enabled(False)
 
     # Setup DDP:cd
-    dist.init_process_group("nccl")
+    dist.init_process_group(
+        "nccl",
+        timeout=timedelta(seconds=args.dist_timeout_seconds),
+    )
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
@@ -78,22 +112,49 @@ def main(args):
         assert int(args.projector_embed_dims.split(',')[0]) == 768
         state_dict = download_model('last.pt')
     else:
-        state_dict = torch.load(ckpt_path, map_location=f'cuda:{device}')['ema']
+        checkpoint = torch.load(
+            ckpt_path,
+            map_location=f'cuda:{device}',
+            # PyTorch 2.6 changed torch.load() to default to weights_only=True.
+            # REPA training checkpoints also save argparse.Namespace in "args",
+            # so local checkpoints need explicit full deserialization here.
+            weights_only=False,
+        )
+        if args.ckpt_weight_key not in checkpoint:
+            available_keys = ", ".join(sorted(checkpoint.keys()))
+            raise KeyError(
+                f"Checkpoint weight key '{args.ckpt_weight_key}' not found in {ckpt_path}. "
+                f"Available keys: {available_keys}"
+            )
+        state_dict = checkpoint[args.ckpt_weight_key]
     if args.legacy:
         state_dict = load_legacy_checkpoints(
             state_dict=state_dict, encoder_depth=args.encoder_depth
             )
     model.load_state_dict(state_dict)
     model.eval()  # important!
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    # Added for offline/local setups: let sampling use the same local-or-remote
+    # VAE selection logic as training so image decoding does not depend on the
+    # machine's default Hugging Face cache contents.
+    resolved_vae_path = args.vae_path if args.vae_path is not None else f"stabilityai/sd-vae-ft-{args.vae}"
+    vae = AutoencoderKL.from_pretrained(resolved_vae_path).to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
     using_cfg = args.cfg_scale > 1.0
 
     # Create folder to save samples:
     model_string_name = args.model.replace("/", "-")
     ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "") if args.ckpt else "pretrained"
-    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.resolution}-vae-{args.vae}-" \
-                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}-{args.mode}"
+    run_string_name = infer_run_name_from_ckpt(args.ckpt)
+    vae_string_name = os.path.basename(os.path.normpath(resolved_vae_path)) if args.vae_path is not None else args.vae
+    projector_dims_string = args.projector_embed_dims.replace(",", "-")
+    folder_name = (
+        f"{model_string_name}-run-{run_string_name}-ckpt-{ckpt_string_name}-"
+        f"weights-{args.ckpt_weight_key}-size-{args.resolution}-vae-{vae_string_name}-path-{args.path_type}-"
+        f"steps-{args.num_steps}-cfg-{args.cfg_scale}-guide-{args.guidance_low}-{args.guidance_high}-"
+        f"proj-{projector_dims_string}-seed-{args.global_seed}-{args.mode}"
+    )
+    if args.sample_name_suffix:
+        folder_name = f"{folder_name}-{args.sample_name_suffix}"
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
@@ -174,11 +235,18 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
 
     # precision
-    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--tf32", action=BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
 
     # logging/saving:
     parser.add_argument("--ckpt", type=str, default=None, help="Optional path to a SiT checkpoint.")
+    parser.add_argument(
+        "--ckpt-weight-key",
+        type=str,
+        default="ema",
+        choices=["ema", "model"],
+        help="Which weight entry to load from a training checkpoint.",
+    )
     parser.add_argument("--sample-dir", type=str, default="samples")
 
     # model
@@ -186,11 +254,14 @@ if __name__ == "__main__":
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--encoder-depth", type=int, default=8)
     parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--fused-attn", action=BooleanOptionalAction, default=False)
+    parser.add_argument("--qk-norm", action=BooleanOptionalAction, default=False)
 
     # vae
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
+    # Added for offline/local setups: allow sampling to load a local Diffusers
+    # VAE directory directly; when provided, this overrides --vae.
+    parser.add_argument("--vae-path", type=str, default=None)
 
     # number of samples
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
@@ -202,12 +273,19 @@ if __name__ == "__main__":
     parser.add_argument("--projector-embed-dims", type=str, default="768,1024")
     parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])
     parser.add_argument("--num-steps", type=int, default=50)
-    parser.add_argument("--heun", action=argparse.BooleanOptionalAction, default=False) # only for ode
+    parser.add_argument("--heun", action=BooleanOptionalAction, default=False) # only for ode
     parser.add_argument("--guidance-low", type=float, default=0.)
     parser.add_argument("--guidance-high", type=float, default=1.)
+    parser.add_argument("--sample-name-suffix", type=str, default=None)
+    parser.add_argument(
+        "--dist-timeout-seconds",
+        type=int,
+        default=3600,
+        help="DDP process group timeout in seconds. Increase this when large sample jobs spend a long time waiting at barriers.",
+    )
 
     # will be deprecated
-    parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False) # only for ode
+    parser.add_argument("--legacy", action=BooleanOptionalAction, default=False) # only for ode
 
 
     args = parser.parse_args()
