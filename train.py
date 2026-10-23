@@ -116,27 +116,17 @@ def sample_posterior(moments, latents_scale=1., latents_bias=0., noise=None):
 
 
 @torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999, optimizer=None, use_optimizer_z=False):
+def update_ema(ema_model, model, decay=0.9999):
     """
     Step the EMA model towards the current model.
     """
     ema_params = OrderedDict(ema_model.named_parameters())
     model_params = OrderedDict(model.named_parameters())
-    optimizer_state = None
-    if use_optimizer_z:
-        if optimizer is None:
-            raise ValueError("optimizer must be provided when use_optimizer_z=True")
-        optimizer_state = get_base_optimizer(optimizer).state
 
     for name, param in model_params.items():
         name = name.replace("module.", "")
         # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
-        source_tensor = param.data
-        if use_optimizer_z:
-            state = optimizer_state.get(param, None)
-            if state is not None and "z" in state:
-                source_tensor = state["z"].to(device=param.device, dtype=param.dtype)
-        ema_params[name].mul_(decay).add_(source_tensor, alpha=1 - decay)
+        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
 def create_logger(logging_dir):
@@ -161,52 +151,6 @@ def requires_grad(model, flag=True):
         p.requires_grad = flag
 
 
-# Added for Nexus compatibility: match the per-parameter gradient
-# normalization used by NexusInnerSGDPrecisionTrainer when optimizing cosine
-# gradient alignment instead of raw dot-product updates.
-def normalize_parameter_gradients(parameters, epsilon=1e-8):
-    for param in parameters:
-        if param.grad is not None:
-            param.grad = param.grad / (torch.norm(param.grad) + float(epsilon))
-
-
-# Added for Nexus compatibility: keep the accumulated inner-loop SGD updates in
-# simple parameter-order buffers so we can roll them back before the outer
-# optimizer step without introducing a second trainer abstraction.
-def allocate_parameter_update_buffers(parameters):
-    return [torch.zeros_like(param, requires_grad=False) for param in parameters]
-
-
-# Added for Nexus compatibility: accumulate the exact temporary parameter
-# displacement caused by the inner SGD steps.
-def accumulate_parameter_updates(parameters, update_buffers, inner_lr):
-    scale = -float(inner_lr)
-    for param, update_buffer in zip(parameters, update_buffers):
-        if param.grad is not None:
-            update_buffer.add_(param.grad.detach(), alpha=scale)
-
-
-# Added for Nexus compatibility: rollback the temporary inner-loop SGD updates
-# and expose the resulting pseudo-gradient to the outer optimizer.
-def rollback_parameter_updates_and_set_gradients(parameters, update_buffers, inner_lr):
-    scale = float(inner_lr)
-    with torch.no_grad():
-        for param, update_buffer in zip(parameters, update_buffers):
-            param.add_(-update_buffer)
-            param.grad = (-update_buffer / scale).to(dtype=torch.float32)
-
-
-# Added for Nexus compatibility: clear the persistent inner-loop update
-# buffers after every completed outer optimization step.
-def zero_parameter_update_buffers(update_buffers):
-    for update_buffer in update_buffers:
-        update_buffer.zero_()
-
-
-
-
-
-
 # Added for LR scheduling: decouple the optimizer schedule step from the
 # checkpoint/global step so resumed runs can restart a decay phase while
 # preserving continuous wandb and checkpoint step numbering.
@@ -226,50 +170,6 @@ def resolve_resume_checkpoint_path(args):
         return os.path.join(args.output_dir, args.exp_name, "checkpoints", ckpt_name)
 
     return None
-
-
-def maybe_restore_args_from_checkpoint(args):
-    """
-    Optionally replace the current CLI args with the args persisted inside the
-    resume checkpoint. This is useful when resuming a partially completed decay
-    run and wanting to keep the original schedule/run configuration without
-    manually re-entering every flag.
-    """
-    if not getattr(args, "resume_use_checkpoint_args", False):
-        return args
-
-    resume_checkpoint_path = resolve_resume_checkpoint_path(args)
-    if resume_checkpoint_path is None:
-        raise ValueError(
-            "--resume-use-checkpoint-args requires --resume-checkpoint-path or --resume-step."
-        )
-    if not os.path.isfile(resume_checkpoint_path):
-        raise FileNotFoundError(
-            "Resume checkpoint not found while restoring checkpoint args: "
-            f"{resume_checkpoint_path}"
-        )
-
-    checkpoint = torch.load(
-        resume_checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-    )
-    if "args" not in checkpoint:
-        raise KeyError(
-            "The resume checkpoint does not contain an 'args' entry, so "
-            "--resume-use-checkpoint-args cannot restore the original run configuration."
-        )
-
-    restored_args = copy.deepcopy(checkpoint["args"])
-
-    # Preserve only the operational CLI flags that decide which checkpoint to
-    # resume from and whether wandb should intentionally start a fresh run.
-    restored_args.resume_step = args.resume_step
-    restored_args.resume_checkpoint_path = args.resume_checkpoint_path
-    restored_args.resume_use_checkpoint_args = args.resume_use_checkpoint_args
-    restored_args.force_new_wandb_run = args.force_new_wandb_run
-
-    return restored_args
 
 
 def get_base_optimizer(optimizer):
@@ -427,32 +327,6 @@ def parse_int_step_list(step_values):
     return parsed_steps
 
 
-
-
-def _normalize_tracked_points_for_cache(tracked_points):
-    normalized_points = []
-    for tracked_point in tracked_points:
-        normalized_points.append(
-            {
-                "name": str(tracked_point["name"]),
-                "fixed_time": None if tracked_point["fixed_time"] is None else float(tracked_point["fixed_time"]),
-            }
-        )
-    return normalized_points
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def compute_training_losses(
     model,
     loss_fn,
@@ -460,7 +334,6 @@ def compute_training_losses(
     labels,
     zs,
     proj_coeff,
-    raw_image=None,
 ):
     model_kwargs = dict(y=labels)
     denoising_loss, denoising_details = loss_fn.compute_denoising_loss(
@@ -785,22 +658,6 @@ def main(args):
             weight_decay=args.adam_weight_decay,
             eps=args.adam_epsilon,
         )
-    # Added for Nexus compatibility: the stable NexusInnerSGDPrecisionTrainer
-    # variant uses a temporary SGD inner loop plus the existing outer
-    # optimizer. Keeping the outer optimizer unchanged minimizes integration
-    # cost with REPA's checkpointing, EMA, and logging stack.
-    inner_optimizer = None
-    if args.optimizer_mode == "nexus-v":
-        inner_optimizer = torch.optim.SGD(
-            model.parameters(),
-            lr=args.nexus_inner_lr,
-            momentum=0.0,
-        )
-        if args.gradient_accumulation_steps % args.nexus_inner_accumulation_steps != 0:
-            raise ValueError(
-                "For Nexus mode, --gradient-accumulation-steps must be divisible by "
-                "--nexus-inner-accumulation-steps."
-            )
     
     # Setup data:
     train_dataset = CustomDataset(args.data_dir)
@@ -905,26 +762,13 @@ def main(args):
         if ema is not None:
             ema.load_state_dict(ckpt['ema'])
         optimizer.load_state_dict(ckpt['opt'])
-        if inner_optimizer is not None and "inner_opt" in ckpt:
-            inner_optimizer.load_state_dict(ckpt["inner_opt"])
         global_step = ckpt['steps']
         if accelerator.is_main_process:
             logger.info(f"Resumed checkpoint from {resume_checkpoint_path} at step {global_step}")
 
-    # Removed for Nexus compatibility:
-    # model, optimizer, train_dataloader = accelerator.prepare(
-    #     model, optimizer, train_dataloader
-    # )
-    # Added for Nexus compatibility: prepare the optional inner optimizer only
-    # when the Nexus training path is enabled.
-    if inner_optimizer is not None:
-        model, optimizer, inner_optimizer, train_dataloader = accelerator.prepare(
-            model, optimizer, inner_optimizer, train_dataloader
-        )
-    else:
-        model, optimizer, train_dataloader = accelerator.prepare(
-            model, optimizer, train_dataloader
-        )
+    model, optimizer, train_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader
+    )
     set_optimizer_train_mode(optimizer, train_mode=True)
 
     if accelerator.is_main_process:
@@ -1002,17 +846,6 @@ def main(args):
     # Create sampling noise:
     n = ys.size(0)
     xT = torch.randn((n, 4, latent_size, latent_size), device=device)
-    # Added for Nexus compatibility: allocate the persistent inner-loop update
-    # buffers after accelerator.prepare so they match the wrapped model
-    # parameters exactly.
-    nexus_trainable_params = None
-    nexus_update_buffers = None
-    nexus_micro_step = 0
-    if args.optimizer_mode == "nexus-v":
-        nexus_trainable_params = [param for param in model.parameters() if param.requires_grad]
-        nexus_update_buffers = allocate_parameter_update_buffers(nexus_trainable_params)
-        optimizer.zero_grad(set_to_none=True)
-        inner_optimizer.zero_grad(set_to_none=True)
         
     for epoch in range(args.epochs):
         model.train()
@@ -1041,10 +874,7 @@ def main(args):
                         if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
                         zs.append(z)
 
-            if args.optimizer_mode == "nexus-v":
-                # Added for Nexus compatibility: reproduce the stable
-                # NexusInnerSGDPrecisionTrainer behavior inside REPA's existing
-                # training loop instead of introducing a second trainer stack.
+            with accelerator.accumulate(model):
                 loss_outputs = compute_training_losses(
                     model=model,
                     loss_fn=loss_fn,
@@ -1052,138 +882,45 @@ def main(args):
                     labels=labels,
                     zs=zs,
                     proj_coeff=args.proj_coeff,
-                    raw_image=raw_image,
                 )
                 loss_mean = loss_outputs["denoising_loss"].mean()
                 proj_loss_mean = loss_outputs["projection_loss"].mean()
                 total_loss_mean = loss_outputs["total_loss"].mean()
-                scaled_total_loss = total_loss_mean / args.gradient_accumulation_steps
+                loss = total_loss_mean
 
-                accelerator.backward(scaled_total_loss)
-                nexus_micro_step += 1
-
-                if nexus_micro_step % args.nexus_inner_accumulation_steps == 0:
-                    if args.nexus_gradient_mode == "cosine":
-                        normalize_parameter_gradients(
-                            nexus_trainable_params,
-                            epsilon=args.nexus_normalize_gradient_epsilon,
-                        )
-                    accumulate_parameter_updates(
-                        nexus_trainable_params,
-                        nexus_update_buffers,
-                        args.nexus_inner_lr,
-                    )
-                    inner_optimizer.step()
-                    inner_optimizer.zero_grad(set_to_none=True)
-
-                # Added for Nexus compatibility: only complete a visible/global
-                # step after the outer optimizer consumes the accumulated inner
-                # SGD displacement.
-                if nexus_micro_step % args.gradient_accumulation_steps == 0:
-                    # Added for LR scheduling: keep the wandb/global step continuous
-                    # while allowing the LR schedule to restart from a user-chosen step.
-                    lr_schedule_step = get_lr_schedule_step(
-                        global_step=global_step,
-                        lr_schedule_start_step=args.lr_schedule_start_step,
-                    )
-                    # Added for LR scheduling: update the optimizer LR from the selected
-                    # schedule right before the optimizer step so wandb can track it.
-                    if args.optimizer_mode == "adamw_schedulefree":
-                        current_lr = get_optimizer_logged_lr(optimizer, args.learning_rate)
-                    else:
-                        current_lr = apply_scheduled_lr(
-                            optimizer=optimizer,
-                            step=lr_schedule_step,
-                            base_lr=args.learning_rate,
-                            schedule_type=args.lr_schedule,
-                            warmup_steps=args.warmup_steps,
-                            decay_steps=args.lr_decay_steps if args.lr_decay_steps > 0 else args.max_train_steps,
-                            min_lr=args.min_lr,
-                        )
-
-                    rollback_parameter_updates_and_set_gradients(
-                        nexus_trainable_params,
-                        nexus_update_buffers,
-                        args.nexus_inner_lr,
-                    )
-                    grad_norm = accelerator.clip_grad_norm_(nexus_trainable_params, args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    inner_optimizer.zero_grad(set_to_none=True)
-                    zero_parameter_update_buffers(nexus_update_buffers)
-                    if args.optimizer_mode == "adamw_schedulefree":
-                        current_lr = get_optimizer_logged_lr(optimizer, args.learning_rate)
-                    if ema is not None:
-                        update_ema(
-                            ema,
-                            model,
-                            optimizer=optimizer,
-                            use_optimizer_z=(args.optimizer_mode == "adamw_schedulefree"),
-                        )
-                    did_outer_step = True
+                # Added for LR scheduling: keep the wandb/global step continuous
+                # while allowing the LR schedule to restart from a user-chosen step.
+                lr_schedule_step = get_lr_schedule_step(
+                    global_step=global_step,
+                    lr_schedule_start_step=args.lr_schedule_start_step,
+                )
+                # Added for LR scheduling: update the optimizer LR from the selected
+                # schedule right before the optimizer step so wandb can track it.
+                if args.optimizer_mode == "adamw_schedulefree":
+                    current_lr = get_optimizer_logged_lr(optimizer, args.learning_rate)
                 else:
-                    did_outer_step = False
-            else:
-                with accelerator.accumulate(model):
-                    loss_outputs = compute_training_losses(
-                        model=model,
-                        loss_fn=loss_fn,
-                        images=x,
-                        labels=labels,
-                        zs=zs,
-                        proj_coeff=args.proj_coeff,
-                        raw_image=raw_image,
+                    current_lr = apply_scheduled_lr(
+                        optimizer=optimizer,
+                        step=lr_schedule_step,
+                        base_lr=args.learning_rate,
+                        schedule_type=args.lr_schedule,
+                        warmup_steps=args.warmup_steps,
+                        decay_steps=args.lr_decay_steps if args.lr_decay_steps > 0 else args.max_train_steps,
+                        min_lr=args.min_lr,
                     )
-                    loss_mean = loss_outputs["denoising_loss"].mean()
-                    proj_loss_mean = loss_outputs["projection_loss"].mean()
-                    total_loss_mean = loss_outputs["total_loss"].mean()
-                    loss = total_loss_mean
+                ## optimization
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = model.parameters()
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if accelerator.sync_gradients and args.optimizer_mode == "adamw_schedulefree":
+                    current_lr = get_optimizer_logged_lr(optimizer, args.learning_rate)
 
-                    # Added for LR scheduling: keep the wandb/global step continuous
-                    # while allowing the LR schedule to restart from a user-chosen step.
-                    lr_schedule_step = get_lr_schedule_step(
-                        global_step=global_step,
-                        lr_schedule_start_step=args.lr_schedule_start_step,
-                    )
-                    # Added for LR scheduling: update the optimizer LR from the selected
-                    # schedule right before the optimizer step so wandb can track it.
-                    if args.optimizer_mode == "adamw_schedulefree":
-                        current_lr = get_optimizer_logged_lr(optimizer, args.learning_rate)
-                    else:
-                        current_lr = apply_scheduled_lr(
-                            optimizer=optimizer,
-                            step=lr_schedule_step,
-                            base_lr=args.learning_rate,
-                            schedule_type=args.lr_schedule,
-                            warmup_steps=args.warmup_steps,
-                            decay_steps=args.lr_decay_steps if args.lr_decay_steps > 0 else args.max_train_steps,
-                            min_lr=args.min_lr,
-                        )
-                    ## optimization
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        params_to_clip = model.parameters()
-                        grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    if accelerator.sync_gradients and args.optimizer_mode == "adamw_schedulefree":
-                        current_lr = get_optimizer_logged_lr(optimizer, args.learning_rate)
-
-                    if accelerator.sync_gradients and ema is not None:
-                        update_ema(
-                            ema,
-                            model,
-                            optimizer=optimizer,
-                            use_optimizer_z=(args.optimizer_mode == "adamw_schedulefree"),
-                        )
-                did_outer_step = accelerator.sync_gradients
-            
-            # Removed for Nexus compatibility:
-            # if accelerator.sync_gradients:
-            # Added for Nexus compatibility: keep the original side effects
-            # bound to real outer-optimizer steps in both baseline and Nexus
-            # modes.
-            if did_outer_step:
+                if accelerator.sync_gradients and ema is not None:
+                    update_ema(ema, model)
+            if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
 
@@ -1216,7 +953,6 @@ def main(args):
                             "model": model_state_dict,
                             "ema": model_state_dict if alias_schedulefree_x else ema.state_dict(),
                             "opt": optimizer.state_dict(),
-                            **({"inner_opt": inner_optimizer.state_dict()} if inner_optimizer is not None else {}),
                             "args": args,
                             "steps": global_step,
                         }
@@ -1272,21 +1008,17 @@ def main(args):
                     logging.info("Generated model and EMA samples.")
 
                 if should_run_fixed_eval:
-                    # Added for fixed sigma/t evaluation tracking: run deterministic
-                    # train/val denoising, projection, and full-objective probes so
-                    # each fixed t/random_t curve exposes the same components used
-                    # by the training objective.
-                    model_was_training = model.training
-                    model.eval()
-                    alias_schedulefree_x = should_alias_schedulefree_x_to_ema(args)
-                    fixed_eval_logs = {}
-                    fixed_train_metrics = evaluate_fixed_losses(
+                    run_fixed_evaluation(
                         model=model,
+                        ema=ema,
                         loss_fn=loss_fn,
-                        dataloader=fixed_train_loader,
-                        cache=fixed_train_cache,
-                        cache_positions=fixed_train_positions,
-                        tracked_points=fixed_eval_plan,
+                        fixed_train_loader=fixed_train_loader,
+                        fixed_train_cache=fixed_train_cache,
+                        fixed_train_positions=fixed_train_positions,
+                        fixed_test_loader=fixed_test_loader,
+                        fixed_test_cache=fixed_test_cache,
+                        fixed_test_positions=fixed_test_positions,
+                        fixed_eval_plan=fixed_eval_plan,
                         accelerator=accelerator,
                         device=device,
                         latents_scale=latents_scale,
@@ -1294,131 +1026,9 @@ def main(args):
                         encoders=encoders,
                         encoder_types=encoder_types,
                         proj_coeff=args.proj_coeff,
+                        use_schedulefree_x_as_ema=should_alias_schedulefree_x_to_ema(args),
+                        step=global_step,
                     )
-                    fixed_val_metrics = evaluate_fixed_losses(
-                        model=model,
-                        loss_fn=loss_fn,
-                        dataloader=fixed_test_loader,
-                        cache=fixed_test_cache,
-                        cache_positions=fixed_test_positions,
-                        tracked_points=fixed_eval_plan,
-                        accelerator=accelerator,
-                        device=device,
-                        latents_scale=latents_scale,
-                        latents_bias=latents_bias,
-                        encoders=encoders,
-                        encoder_types=encoder_types,
-                        proj_coeff=args.proj_coeff,
-                    )
-                    if alias_schedulefree_x:
-                        fixed_train_metrics_ema = fixed_train_metrics
-                        fixed_val_metrics_ema = fixed_val_metrics
-                    else:
-                        fixed_train_metrics_ema = evaluate_fixed_losses(
-                            model=ema,
-                            loss_fn=loss_fn,
-                            dataloader=fixed_train_loader,
-                            cache=fixed_train_cache,
-                            cache_positions=fixed_train_positions,
-                            tracked_points=fixed_eval_plan,
-                            accelerator=accelerator,
-                            device=device,
-                            latents_scale=latents_scale,
-                            latents_bias=latents_bias,
-                            encoders=encoders,
-                            encoder_types=encoder_types,
-                            proj_coeff=args.proj_coeff,
-                        )
-                        fixed_val_metrics_ema = evaluate_fixed_losses(
-                            model=ema,
-                            loss_fn=loss_fn,
-                            dataloader=fixed_test_loader,
-                            cache=fixed_test_cache,
-                            cache_positions=fixed_test_positions,
-                            tracked_points=fixed_eval_plan,
-                            accelerator=accelerator,
-                            device=device,
-                            latents_scale=latents_scale,
-                            latents_bias=latents_bias,
-                            encoders=encoders,
-                            encoder_types=encoder_types,
-                            proj_coeff=args.proj_coeff,
-                        )
-                        fixed_eval_logs.update(
-                            {
-                                f"fixed_train_mse/{metric_name}": metric_value
-                                for metric_name, metric_value in fixed_train_metrics["denoising"].items()
-                            }
-                        )
-                        fixed_eval_logs.update(
-                            {
-                                f"fixed_test_mse/{metric_name}": metric_value
-                                for metric_name, metric_value in fixed_val_metrics["denoising"].items()
-                            }
-                        )
-                        fixed_eval_logs.update(
-                            {
-                                f"fixed_train_proj_loss/{metric_name}": metric_value
-                                for metric_name, metric_value in fixed_train_metrics["projection"].items()
-                            }
-                        )
-                        fixed_eval_logs.update(
-                            {
-                                f"fixed_val_proj_loss/{metric_name}": metric_value
-                                for metric_name, metric_value in fixed_val_metrics["projection"].items()
-                            }
-                        )
-                        fixed_eval_logs.update(
-                            {
-                                f"fixed_train_total_loss/{metric_name}": metric_value
-                                for metric_name, metric_value in fixed_train_metrics["total"].items()
-                            }
-                        )
-                        fixed_eval_logs.update(
-                            {
-                                f"fixed_val_total_loss/{metric_name}": metric_value
-                                for metric_name, metric_value in fixed_val_metrics["total"].items()
-                            }
-                        )
-                    fixed_eval_logs.update(
-                        {
-                            f"fixed_train_mse_ema/{metric_name}": metric_value
-                            for metric_name, metric_value in fixed_train_metrics_ema["denoising"].items()
-                        }
-                    )
-                    fixed_eval_logs.update(
-                        {
-                            f"fixed_test_mse_ema/{metric_name}": metric_value
-                            for metric_name, metric_value in fixed_val_metrics_ema["denoising"].items()
-                        }
-                    )
-                    fixed_eval_logs.update(
-                        {
-                            f"fixed_train_proj_loss_ema/{metric_name}": metric_value
-                            for metric_name, metric_value in fixed_train_metrics_ema["projection"].items()
-                        }
-                    )
-                    fixed_eval_logs.update(
-                        {
-                            f"fixed_val_proj_loss_ema/{metric_name}": metric_value
-                            for metric_name, metric_value in fixed_val_metrics_ema["projection"].items()
-                        }
-                    )
-                    fixed_eval_logs.update(
-                        {
-                            f"fixed_train_total_loss_ema/{metric_name}": metric_value
-                            for metric_name, metric_value in fixed_train_metrics_ema["total"].items()
-                        }
-                    )
-                    fixed_eval_logs.update(
-                        {
-                            f"fixed_val_total_loss_ema/{metric_name}": metric_value
-                            for metric_name, metric_value in fixed_val_metrics_ema["total"].items()
-                        }
-                    )
-                    accelerator.log(fixed_eval_logs, step=global_step)
-                    if model_was_training:
-                        model.train()
 
                 if optimizer_eval_context and global_step < args.max_train_steps:
                     set_optimizer_train_mode(optimizer, train_mode=True)
@@ -1458,15 +1068,6 @@ def parse_args(input_args=None):
     parser.add_argument("--sampling-steps", type=int, default=10000)
     parser.add_argument("--resume-step", type=int, default=0)
     parser.add_argument("--resume-checkpoint-path", type=str, default=None)
-    parser.add_argument(
-        "--resume-use-checkpoint-args",
-        action="store_true",
-        help=(
-            "Restore the original training args saved inside the resume checkpoint. "
-            "Useful for resuming an interrupted decay run without manually re-entering "
-            "the original exp-name/output-dir/LR schedule flags."
-        ),
-    )
     parser.add_argument("--force-new-wandb-run", action="store_true")
 
     # model
@@ -1525,21 +1126,13 @@ def parse_args(input_args=None):
         default=0.0,
         help="Inner gradient EMA momentum used by AdamWScheduleFree.",
     )
-    # Added for optimizer experimentation: keep the original AdamW path,
-    # expose AdamWScheduleFree as a direct alternative, and preserve the
-    # Nexus inner-SGD outer-optimizer approximation without introducing a
-    # second training entrypoint.
+    # Select the standard or Schedule-Free AdamW update.
     parser.add_argument(
         "--optimizer-mode",
         type=str,
         default="adamw",
-        choices=["adamw", "adamw_schedulefree", "nexus-v"],
+        choices=["adamw", "adamw_schedulefree"],
     )
-    parser.add_argument("--nexus-inner-lr", type=float, default=0.1)
-    parser.add_argument("--nexus-inner-accumulation-steps", type=int, default=1)
-    parser.add_argument("--nexus-gradient-mode", type=str, default="cosine", choices=["dot", "cosine"])
-    parser.add_argument("--nexus-normalize-gradient-epsilon", type=float, default=1e-8)
-    parser.add_argument("--nexus-inner-similarity-steps", type=int, default=0, help=argparse.SUPPRESS)
     # Added for LR scheduling: expose the schedule mode and its controls so users
     # can switch between constant, warmup+constant, linear decay, and cosine decay
     # without editing code.
@@ -1574,8 +1167,6 @@ def parse_args(input_args=None):
     parser.add_argument("--fixed-eval-ts", type=str, default="0.05,0.2,0.5")
     parser.add_argument("--fixed-eval-include-random", action="store_true")
     parser.add_argument("--fixed-eval-seed", type=int, default=1234)
-    parser.add_argument("--fixed-gradient-num-samples", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--fixed-gradient-seed", type=int, default=None, help=argparse.SUPPRESS)
 
     # seed
     parser.add_argument("--seed", type=int, default=0)
@@ -1603,6 +1194,4 @@ def parse_args(input_args=None):
 
 if __name__ == "__main__":
     args = parse_args()
-    args = maybe_restore_args_from_checkpoint(args)
-    
     main(args)
